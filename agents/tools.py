@@ -82,6 +82,45 @@ def suggest_required_fields(req: Request, args: Dict[str, Any]) -> Dict[str, Any
         "known_entities": req.entities or {},
     }
 
+def lookup_error_code(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+    """技术工具：解释常见错误码的排查方向，不声称读取了服务端日志。"""
+    code = str(args.get("error_code", "")).upper().strip()
+    mapping = {
+        "401": ("认证失败", ["确认 Token/API Key 是否过期", "确认请求时间戳和签名", "确认账号登录状态"]),
+        "403": ("权限不足", ["确认账号或套餐权限", "确认资源权限和 IP 白名单"]),
+        "404": ("资源或路径不存在", ["确认接口路径和环境", "确认资源标识是否正确"]),
+        "500": ("服务端处理异常", ["记录 request_id 和发生时间", "检查依赖服务、参数格式和服务端日志"]),
+    }
+    meaning, steps = mapping.get(
+        code,
+        ("暂未识别的错误码", ["补充完整错误信息、发生时间和运行环境"]),
+    )
+    return {
+        "error_code": code,
+        "meaning": meaning,
+        "next_steps": steps,
+        "server_log_checked": False,
+    }
+
+def build_diagnostic_plan(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+    """技术工具：生成低风险排障顺序。"""
+    environment = str(args.get("environment", "unknown"))[:80]
+    reproduced = bool(args.get("reproduced", False))
+    steps = [
+        "复现并记录完整错误信息",
+        "确认网络、DNS、代理和证书",
+        "确认版本、配置和权限",
+    ]
+    if reproduced:
+        steps.append("用最小请求复现并记录 request_id")
+    return {
+        "environment": environment,
+        "reproduced": reproduced,
+        "diagnostic_steps": steps,
+    }
+
+
+
 def general_tools() -> Dict[str, AgentToolSpec]:
     return {
         "inspect_request_context": make_tool(
@@ -97,3 +136,25 @@ def general_tools() -> Dict[str, AgentToolSpec]:
             suggest_required_fields,
         ),
     }
+
+def technical_tools() -> Dict[str, AgentToolSpec]:
+    return {
+        "lookup_error_code": make_tool(
+            "lookup_error_code",
+            "解释常见 HTTP 错误码的可能含义和低风险排查方向；不会读取服务端日志。",
+            {"error_code": {"type": "string", "description": "例如 401、403、500"}},
+            lookup_error_code,
+            required=["error_code"],
+        ),
+        "build_diagnostic_plan": make_tool(
+            "build_diagnostic_plan",
+            "根据运行环境和是否可复现生成排障顺序，不执行修改配置等操作。",
+            {
+                "environment": {"type": "string", "description": "App、浏览器、服务端或 Docker 等"},
+                "reproduced": {"type": "boolean", "description": "问题是否可以稳定复现"},
+            },
+            build_diagnostic_plan,
+            required=["environment", "reproduced"],
+        ),
+    }
+
