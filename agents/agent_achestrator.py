@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Tuple, Optional, List, Dict, Any
 from anthropic import AsyncAnthropic
 
-from agents.tools import AgentToolSpec, general_tools, technical_tools
+from agents.tools import AgentToolSpec, general_tools, technical_tools, billing_tools, escalation_tools
 from core.Intent_recognizer import IntentCategory, UrgencyLevel
 from core.llm_utils import extract_text_content
 
@@ -452,3 +452,92 @@ class TechnicalAgent(BaseAgent):
         tools = super().get_tools()
         tools.update(technical_tools())
         return tools
+
+class BillingAgent(BaseAgent):
+    agent_type    = AgentType.BILLING
+    profile = AgentProfile(
+        role="账单核验与售后处理",
+        mission="区分扣款、退款、发票、订阅等资金场景，解释可判断事实，并明确核验和人工审核边界。",
+        workflow=("确认账单场景", "收集必要核验字段", "区分订单/实付/退款金额", "说明处理路径与时效", "判断是否升级"),
+        input_contract=("订单号", "金额与币种", "支付时间", "支付渠道", "用户期望", "知识库上下文"),
+        output_contract=("需要核验的信息", "当前可判断内容", "下一步处理路径", "时效边界"),
+        handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单"),
+        tool_scope=("search_knowledge_base", "check_billing_fields", "compare_amounts"),
+        temperature=0.0,
+        max_tokens=1100,
+    )
+    system_prompt = (
+        "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
+        "对财务问题保持准确和专业。涉及实际退款操作时，说明需要人工审核。"
+    )
+
+    def _build_role_packet(self, req: Request) -> str:
+        packet = json.loads(super()._build_role_packet(req))
+        packet["verification_fields"] = {
+            "order_id": req.entities.get("order_id", []),
+            "amount": req.entities.get("amount", []),
+            "date": req.entities.get("date", []),
+            "missing_fields": [
+                field for field, values in (
+                    ("订单号或交易号", req.entities.get("order_id", [])),
+                    ("支付金额", req.entities.get("amount", [])),
+                ) if not values
+            ],
+            "risk_boundary": "不得承诺退款成功、立即到账或直接修改账单",
+        }
+        return json.dumps(packet, ensure_ascii=False)
+
+    def get_tools(self) -> Dict[str, AgentToolSpec]:
+        tools = super().get_tools()
+        tools.update(billing_tools())
+        return tools
+
+class EscalationAgent(BaseAgent):
+    """人工升级节点。
+
+    升级不是一个普通问答 Prompt：它应该生成标准化的交接信息并停止普通
+    Agent 继续编造答案。生产环境可在这里接工单系统、人工队列或 Webhook。
+    """
+
+    agent_type = AgentType.ESCALATION
+    profile = AgentProfile(
+        role="人工升级与交接",
+        mission="确认升级原因，整理已知上下文，告知用户下一步，不执行未经授权的业务操作。",
+        workflow=("确认升级原因", "整理已知信息", "标记优先级", "生成交接摘要"),
+        input_contract=("用户消息", "意图", "紧急度", "结构化实体", "对话背景"),
+        output_contract=("升级原因", "已知信息摘要", "还需补充的信息", "保守的后续说明"),
+        handoff_conditions=("用户明确要求人工", "紧急或高风险场景"),
+        tool_scope=("search_knowledge_base", "create_handoff_summary"),
+        temperature=0.0,
+        max_tokens=500,
+    )
+    system_prompt = "你负责客服人工升级交接，不要继续模拟已完成的后台操作。"
+
+    def get_tools(self) -> Dict[str, AgentToolSpec]:
+        tools = super().get_tools()
+        tools.update(escalation_tools())
+        return tools
+
+    async def handle(self, req: Request) -> AgentResponse:
+        t0 = time.monotonic()
+        self.stats.total += 1
+        intent = req.intent.value if req.intent else "unknown"
+        urgency = req.urgency.name if req.urgency else "UNKNOWN"
+        entities = json.dumps(req.entities or {}, ensure_ascii=False)
+        content = (
+            "我已将这个问题标记为人工升级处理。\n\n"
+            f"升级原因：意图={intent}，紧急度={urgency}\n"
+            f"已记录信息：{entities}\n"
+            "请不要发送密码、短信验证码或完整支付凭证；人工客服会根据会话记录继续核验。"
+        )
+        ms = (time.monotonic() - t0) * 1000
+        self.stats.success += 1
+        self.stats.total_ms += ms
+        return AgentResponse(
+            agent_type=self.agent_type,
+            content=content,
+            success=True,
+            latency_ms=ms,
+            escalate=True,
+            tools_used=[],
+        )

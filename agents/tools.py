@@ -119,6 +119,47 @@ def build_diagnostic_plan(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
         "diagnostic_steps": steps,
     }
 
+def check_billing_fields(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+    """账单工具：检查必要核验字段是否齐全。"""
+    fields = {
+        "order_id": bool(req.entities.get("order_id")),
+        "amount": bool(req.entities.get("amount")),
+        "date": bool(req.entities.get("date")),
+        "payment_channel": bool(args.get("payment_channel")),
+    }
+    return {
+        "fields": fields,
+        "missing_fields": [name for name, present in fields.items() if not present],
+        "can_confirm_refund": False,
+        "reason": "当前工具只做字段检查，不连接订单或支付系统",
+    }
+
+
+def compare_amounts(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+    """账单工具：只做用户明确提供金额之间的算术。"""
+    try:
+        first = float(args["amount_a"])
+        second = float(args["amount_b"])
+    except (KeyError, TypeError, ValueError):
+        return {"success": False, "error": "amount_a 和 amount_b 必须是数字"}
+    return {
+        "success": True,
+        "amount_a": first,
+        "amount_b": second,
+        "difference": round(first - second, 2),
+        "interpretation": "仅表示金额差值，不代表重复扣款或退款结论",
+    }
+
+def create_handoff_summary(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+    """升级工具：生成可交给人工客服的结构化摘要。"""
+    return {
+        "request_id": req.request_id,
+        "reason": str(args.get("reason", "需要人工客服继续核验"))[:120],
+        "intent": req.intent.value if req.intent else "unknown",
+        "urgency": req.urgency.name if req.urgency else "UNKNOWN",
+        "entities": req.entities or {},
+        "sensitive_data_required": False,
+    }
 
 
 def general_tools() -> Dict[str, AgentToolSpec]:
@@ -158,3 +199,32 @@ def technical_tools() -> Dict[str, AgentToolSpec]:
         ),
     }
 
+def billing_tools() -> Dict[str, AgentToolSpec]:
+    return {
+        "check_billing_fields": make_tool(
+            "check_billing_fields",
+            "检查账单核验字段是否齐全；不连接订单、支付或退款系统。",
+            {"payment_channel": {"type": "string", "description": "支付渠道，例如微信、支付宝、银行卡"}},
+            check_billing_fields,
+        ),
+        "compare_amounts": make_tool(
+            "compare_amounts",
+            "计算用户明确提供的两笔金额差值；不判断是否重复扣款，也不执行退款。",
+            {
+                "amount_a": {"type": "number", "description": "第一笔金额"},
+                "amount_b": {"type": "number", "description": "第二笔金额"},
+            },
+            compare_amounts,
+            required=["amount_a", "amount_b"],
+        ),
+    }
+
+def escalation_tools() -> Dict[str, AgentToolSpec]:
+    return {
+        "create_handoff_summary": make_tool(
+            "create_handoff_summary",
+            "生成交给人工客服的结构化交接摘要，不会创建真实工单。",
+            {"reason": {"type": "string", "description": "需要升级的原因"}},
+            create_handoff_summary,
+        ),
+    }
