@@ -11,7 +11,10 @@ ChromaDB 在这里的角色：
   - 这里用于存储知识库文档（RAG 检索）
   两者是不同的 collection，互不干扰。
 """
+import asyncio
+import hashlib
 import logging
+from typing import List, Dict
 
 import chromadb
 
@@ -62,6 +65,40 @@ class KnowledgeBase:
         # 如果知识库为空，导入默认文档
         if self._collection.count() == 0:
             self._load_default_docs()
+
+        # ── 文档管理 ──────────────────────────────────────────────────────────────
+
+        def add_documents(self, documents: List[Dict[str, str]]) -> int:
+            """
+            批量导入文档到知识库。
+
+            documents 格式: [{"title": "...", "content": "..."}, ...]
+            长文档会自动切片（每片 500 字）。
+            """
+            ids, docs, metas = [], [], []
+
+            for doc in documents:
+                title = doc.get("title", "")
+                content = doc.get("content", "")
+                chunks = self._chunk_text(content, chunk_size=500)
+
+                for i, chunk in enumerate(chunks):
+                    doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
+                    ids.append(doc_id)
+                    docs.append(chunk)
+                    metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
+
+            if ids:
+                # ID 由文档内容稳定生成；upsert 使重复导入幂等，同时允许同 ID 内容更新。
+                # ChromaDB 会自动生成或更新 Embedding。
+                self._collection.upsert(ids=ids, documents=docs, metadatas=metas)
+                logger.info(f"知识库写入 {len(ids)} 个文档片段")
+
+            return len(ids)
+
+        async def add_documents_async(self, documents: List[Dict[str, str]]) -> int:
+            """异步导入文档；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
+            return await asyncio.to_thread(self.add_documents, documents)
 
     def _load_default_docs(self) -> None:
         """导入默认知识库文档（客服场景常见问题）。"""
