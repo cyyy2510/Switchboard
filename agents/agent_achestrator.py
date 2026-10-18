@@ -4,13 +4,14 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Tuple, Optional, List, Dict, Any
 from anthropic import AsyncAnthropic
 
 from agents.tools import AgentToolSpec, general_tools, technical_tools, billing_tools, escalation_tools
-from core.Intent_recognizer import IntentCategory, UrgencyLevel
+from core.Intent_recognizer import IntentCategory, UrgencyLevel, IntentRecognizer
 from core.llm_utils import extract_text_content
 
 logger = logging.getLogger(__name__)
@@ -541,3 +542,63 @@ class EscalationAgent(BaseAgent):
             escalate=True,
             tools_used=[],
         )
+
+# ── 编排器 ────────────────────────────────────────────────────────────────────
+
+class AgentOrchestrator:
+    """
+    多 Agent 编排器。
+
+    路由逻辑（三层）：
+      1. 意图 → Agent 类型映射
+      2. 同类多实例时按 routing_score() 选最优
+      3. 专属 Agent 失败时降级到 GeneralAgent
+    """
+
+    # 意图 → Agent 类型的静态映射（路由表）
+    _INTENT_ROUTING: Dict[IntentCategory, AgentType] = {
+        IntentCategory.TECHNICAL:  AgentType.TECHNICAL,
+        IntentCategory.TECHNICAL_LOGIN: AgentType.TECHNICAL,
+        IntentCategory.TECHNICAL_CRASH: AgentType.TECHNICAL,
+        IntentCategory.BILLING:    AgentType.BILLING,
+        IntentCategory.REFUND:     AgentType.BILLING,
+        IntentCategory.INVOICE:    AgentType.BILLING,
+        IntentCategory.PAYMENT_ISSUE: AgentType.BILLING,
+        IntentCategory.ACCOUNT:    AgentType.BILLING,
+        IntentCategory.ACCOUNT_SECURITY: AgentType.BILLING,
+        IntentCategory.ESCALATION: AgentType.ESCALATION,
+        IntentCategory.HUMAN_HANDOFF: AgentType.ESCALATION,
+        # 其余意图 → GENERAL（默认）
+    }
+
+    # Monitor 的降权达到该值时，专业 Agent 暂停接收新请求并回退到 GeneralAgent。
+    # 使用环境变量可按线上数据调整，默认值与 Monitor 的严重成功率惩罚上限一致。
+    MONITOR_FALLBACK_PENALTY = 0.5
+
+    def __init__(
+        self,
+        api_key:  str,
+        base_url: Optional[str] = None,
+        model:    str = "claude-3-5-sonnet-20241022",
+        skill_manager: Optional[Any] = None,
+        rag_tool_manager: Optional[Any] = None,
+    ):
+        kwargs: Dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        client = AsyncAnthropic(**kwargs)
+
+        self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
+        self._skill_manager = skill_manager
+        self._composer = ResponseComposer(client, model, skill_manager)
+        self._shared_tools: Dict[str, AgentToolSpec] = {}
+        self._recent_tool_traces = deque(maxlen=_env_int("ECHOMIND_TOOL_TRACE_MAX", 200))
+
+        # Agent 池：每种类型可有多个实例（水平扩展）
+        self._pool: Dict[AgentType, List[BaseAgent]] = {
+            AgentType.GENERAL: [self._make_agent(GeneralAgent, client, model, skill_manager)],
+            AgentType.TECHNICAL: [self._make_agent(TechnicalAgent, client, model, skill_manager)],
+            AgentType.BILLING: [self._make_agent(BillingAgent, client, model, skill_manager)],
+            AgentType.ESCALATION: [self._make_agent(EscalationAgent, client, model, skill_manager)],
+        }
+        self.set_shared_tools(build_shared_rag_tools(rag_tool_manager))

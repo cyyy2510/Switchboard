@@ -1,5 +1,14 @@
+import asyncio
+import json
 import logging
+from dataclasses import field, dataclass
+from datetime import time
 from enum import Enum
+from typing import Dict, List, Optional, Any
+
+from anthropic import AsyncAnthropic
+
+from core.llm_utils import extract_text_content
 
 logger = logging.getLogger(__name__)
 
@@ -29,3 +38,281 @@ class UrgencyLevel(Enum):
     MEDIUM   = 2
     HIGH     = 3
     CRITICAL = 4
+
+@dataclass
+class IntentResult:
+    intent:     IntentCategory
+    confidence: float
+    urgency:    UrgencyLevel
+    intent_group: str
+    entities:   Dict[str, List[str]]   # 从消息中提取的实体
+    reasoning:  str
+    latency_ms: float
+    source_scores: Dict[str, float] = field(default_factory=dict)
+
+
+# ── Few-shot 模板（同时用于 LLM 示例和 Embedding 匹配）────────────────────────
+_TEMPLATES: Dict[IntentCategory, List[str]] = {
+    IntentCategory.QUERY:      ["我的订单状态是什么？", "如何重置密码？", "快递什么时候到？"],
+    IntentCategory.COMPLAINT:  ["等了好几个小时！", "服务太差了！", "一直没人处理！"],
+    IntentCategory.REQUEST:    ["帮我取消订单", "我需要修改地址", "请协助退款"],
+    IntentCategory.GREETING:   ["你好", "嗨，有人吗", "早上好"],
+    IntentCategory.ESCALATION: ["我要投诉！", "转人工客服", "找你们经理"],
+    IntentCategory.TECHNICAL:  ["应用一直崩溃", "无法登录", "出现500错误"],
+    IntentCategory.BILLING:    ["为什么扣了两次款？", "申请退款", "发票问题"],
+    IntentCategory.ACCOUNT:    ["修改邮箱", "注销账户", "更新个人信息"],
+    IntentCategory.FEEDBACK:   ["服务很棒！", "非常满意", "给个好评"],
+    IntentCategory.ORDER_STATUS: ["我的订单现在是什么状态？", "订单有没有发货？", "订单处理到哪一步了？"],
+    IntentCategory.LOGISTICS: ["快递什么时候到？", "物流一直不更新", "配送要多久？"],
+    IntentCategory.REFUND: ["我要申请退款", "退货退款怎么处理？", "退款多久到账？"],
+    IntentCategory.INVOICE: ["帮我开发票", "发票抬头怎么改？", "电子发票在哪里？"],
+    IntentCategory.PAYMENT_ISSUE: ["为什么重复扣款？", "支付失败怎么办？", "这个月多扣了钱"],
+    IntentCategory.ACCOUNT_SECURITY: ["账户被盗了", "发现异常登录", "我要重置密码"],
+    IntentCategory.TECHNICAL_LOGIN: ["登录一直报401", "验证码收不到", "无法登录账号"],
+    IntentCategory.TECHNICAL_CRASH: ["应用一直崩溃", "页面报500错误", "系统闪退"],
+    IntentCategory.HUMAN_HANDOFF: ["转人工客服", "我要找人工", "请升级处理"],
+}
+
+_SPECIFIC_INTENTS = {
+    IntentCategory.ORDER_STATUS,
+    IntentCategory.LOGISTICS,
+    IntentCategory.REFUND,
+    IntentCategory.INVOICE,
+    IntentCategory.PAYMENT_ISSUE,
+    IntentCategory.ACCOUNT_SECURITY,
+    IntentCategory.TECHNICAL_LOGIN,
+    IntentCategory.TECHNICAL_CRASH,
+    IntentCategory.HUMAN_HANDOFF,
+}
+
+_GENERIC_INTENTS = {
+    IntentCategory.QUERY,
+    IntentCategory.BILLING,
+    IntentCategory.TECHNICAL,
+    IntentCategory.ACCOUNT,
+    IntentCategory.ESCALATION,
+}
+
+_INTENT_GROUPS: Dict[IntentCategory, IntentCategory] = {
+    IntentCategory.ORDER_STATUS: IntentCategory.QUERY,
+    IntentCategory.LOGISTICS: IntentCategory.QUERY,
+    IntentCategory.REFUND: IntentCategory.BILLING,
+    IntentCategory.INVOICE: IntentCategory.BILLING,
+    IntentCategory.PAYMENT_ISSUE: IntentCategory.BILLING,
+    IntentCategory.ACCOUNT_SECURITY: IntentCategory.ACCOUNT,
+    IntentCategory.TECHNICAL_LOGIN: IntentCategory.TECHNICAL,
+    IntentCategory.TECHNICAL_CRASH: IntentCategory.TECHNICAL,
+    IntentCategory.HUMAN_HANDOFF: IntentCategory.ESCALATION,
+}
+
+# 紧急关键词
+_URGENCY_KEYWORDS = {
+    UrgencyLevel.CRITICAL: ["紧急", "emergency", "urgent", "asap", "立刻"],
+    UrgencyLevel.HIGH:     ["今天", "马上", "尽快", "hurry", "now"],
+    UrgencyLevel.MEDIUM:   ["这周", "soon", "快点"],
+}
+
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    """纯 Python 余弦相似度，不依赖 numpy。"""
+    dot = sum(x * y for x, y in zip(a, b))
+    na  = sum(x * x for x in a) ** 0.5
+    nb  = sum(x * x for x in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
+
+
+class IntentRecognizer:
+    """
+    端到端意图识别器。
+
+    初始化时不加载任何本地模型，所有 AI 能力通过 Anthropic API 调用。
+    模板 Embedding 在首次请求时懒加载并缓存，后续复用。
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: Optional[str] = None,
+        model: str = "claude-3-5-sonnet-20241022",
+        confidence_threshold: float = 0.5,
+    ):
+        kwargs: Dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        self.client    = AsyncAnthropic(**kwargs)
+        self.model     = model
+        self.threshold = confidence_threshold
+        # 本地字符 n-gram 向量始终可用；如果未来客户端暴露 embeddings 资源，
+        # _embed_text 会优先尝试远端向量，否则自动回退本地向量。
+        self._embedding_enabled = True
+
+        self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
+        self._cache: Dict[str, IntentResult] = {}
+        self.cache_hits   = 0
+        self.cache_misses = 0
+
+        # ── 公开接口 ──────────────────────────────────────────────────────────────
+
+        async def recognize(
+                self,
+                message: str,
+                history: Optional[List[Dict[str, str]]] = None,
+        ) -> IntentResult:
+            """
+            识别用户意图。
+
+            history 格式：[{"role": "user"/"assistant", "content": "..."}]
+            """
+            key = self._cache_key(message, history)
+            if key in self._cache:
+                self.cache_hits += 1
+                return self._cache[key]
+            self.cache_misses += 1
+
+            t0 = time.monotonic()
+
+            # LLM 和 Embedding 并行（Embedding 不可用时跳过）
+            llm_task = asyncio.create_task(self._llm_recognize(message, history))
+            emb_task = asyncio.create_task(self._embedding_recognize(message)) if self._embedding_enabled else None
+            pat = self._pattern_recognize(message)
+
+            if emb_task:
+                llm, emb = await asyncio.gather(llm_task, emb_task)
+            else:
+                llm = await llm_task
+                emb = {"intent": IntentCategory.OTHER, "confidence": 0.0}
+
+            intent, confidence, source_scores = self._vote(llm, emb, pat)
+            entities = self._extract_entities(message)
+            urgency = self._urgency(message, intent)
+
+            result = IntentResult(
+                intent=intent,
+                confidence=confidence,
+                urgency=urgency,
+                intent_group=self._intent_group(intent),
+                entities=entities,
+                reasoning=llm.get("reasoning", ""),
+                latency_ms=(time.monotonic() - t0) * 1000,
+                source_scores=source_scores,
+            )
+
+            # LRU 缓存
+            if len(self._cache) >= 1000:
+                for k in list(self._cache)[:500]:
+                    del self._cache[k]
+            self._cache[key] = result
+            return result
+
+        def learn(self, message: str, correct: IntentCategory) -> None:
+            """在线学习：将纠正样本加入模板，清除对应 Embedding 缓存。"""
+            tpls = _TEMPLATES.setdefault(correct, [])
+            if message not in tpls:
+                tpls.append(message)
+                self._tpl_embeddings.pop(correct, None)  # 下次重新计算
+                self._cache.clear()  # 模板更新后旧缓存可能对应过时结果
+                logger.info(f"学习新样本 → {correct.value}: {message[:40]}")
+
+        # ── 三路识别策略 ──────────────────────────────────────────────────────────
+
+        async def _llm_recognize(
+                self,
+                message: str,
+                history: Optional[List[Dict[str, str]]],
+        ) -> Dict[str, Any]:
+            """策略 1：LLM 语义理解（Few-shot + 上下文）。"""
+            message = self._clean_text(message)
+            # 构建 Few-shot 示例
+            examples = "\n".join(
+                f'  消息: "{t}" → 意图: {cat.value}'
+                for cat, tpls in _TEMPLATES.items()
+                for t in tpls[:1]  # 每类取 1 条，控制 prompt 长度
+            )
+            # 最近 3 轮对话上下文
+            ctx = ""
+            if history:
+                ctx = "\n最近对话:\n" + "\n".join(
+                    f"  {self._clean_text(m.get('role', 'user'))}: {self._clean_text(m.get('content', ''))}"
+                    for m in history[-3:]
+                )
+
+            prompt = f"""你是客服意图分析专家。根据示例判断用户意图，返回 JSON。
+    如果用户问题能匹配细粒度业务意图，请优先返回细粒度意图，而不是宽泛大类。
+    例如退款优先返回 refund，发票优先返回 invoice，登录故障优先返回 technical_login。
+
+            {ctx}
+            用户消息: "{message}"
+
+    返回格式（仅 JSON，不要其他文字）:
+    {{"intent": "<意图值>", "confidence": <0-1>, "reasoning": "<一句话说明>"}}
+
+    可选意图: {", ".join(c.value for c in IntentCategory)}"""
+            prompt = self._clean_text(prompt)
+
+            try:
+                resp = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=256,
+                    temperature=0.1,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                raw = extract_text_content(resp.content)
+                s, e = raw.find("{"), raw.rfind("}") + 1
+                data = json.loads(raw[s:e])
+                try:
+                    data["intent"] = IntentCategory(data["intent"])
+                except ValueError:
+                    data["intent"] = IntentCategory.OTHER
+                return data
+            except Exception as ex:
+                logger.warning(f"LLM 识别失败: {ex}")
+                return {"intent": IntentCategory.OTHER, "confidence": 0.0, "reasoning": "LLM 失败", "failed": True}
+
+        async def _embedding_recognize(self, message: str) -> Dict[str, Any]:
+            """策略 2：Embedding 向量相似度匹配。"""
+            try:
+                await self._load_template_embeddings()
+                msg_vec = await self._embed_text(message)
+
+                best_cat, best_score = IntentCategory.OTHER, 0.0
+                for cat, vecs in self._tpl_embeddings.items():
+                    score = max(_cosine(msg_vec, v) for v in vecs)
+                    if score > best_score:
+                        best_score, best_cat = score, cat
+
+                return {"intent": best_cat, "confidence": best_score}
+            except Exception as ex:
+                logger.warning(f"Embedding 识别失败: {ex}")
+                return {"intent": IntentCategory.OTHER, "confidence": 0.0}
+
+        def _pattern_recognize(self, message: str) -> Dict[str, Any]:
+            """策略 3：关键词模式匹配（同步，零延迟兜底）。"""
+            msg = message.lower()
+            specific_patterns = {
+                IntentCategory.HUMAN_HANDOFF: ["转人工", "人工客服", "找人工"],
+                IntentCategory.ORDER_STATUS: ["订单状态", "发货了吗", "处理到哪", "order status"],
+                IntentCategory.LOGISTICS: ["物流", "快递", "配送", "运单", "delivery", "shipping"],
+                IntentCategory.REFUND: ["退款", "退货", "refund", "return"],
+                IntentCategory.INVOICE: ["发票", "抬头", "税号", "invoice"],
+                IntentCategory.PAYMENT_ISSUE: ["重复扣款", "多扣", "支付失败", "扣费", "payment failed"],
+                IntentCategory.ACCOUNT_SECURITY: ["被盗", "异常登录", "重置密码", "两步验证", "安全"],
+                IntentCategory.TECHNICAL_LOGIN: ["无法登录", "登录失败", "401", "验证码"],
+                IntentCategory.TECHNICAL_CRASH: ["崩溃", "闪退", "500", "报错", "crash"],
+            }
+            generic_patterns = {
+                IntentCategory.ESCALATION: ["投诉", "经理", "supervisor"],
+                IntentCategory.COMPLAINT: ["太差", "糟糕", "horrible", "等了很久"],
+                IntentCategory.QUERY: ["?", "？", "怎么", "什么", "status"],
+                IntentCategory.REQUEST: ["帮我", "需要", "please", "help"],
+                IntentCategory.GREETING: ["你好", "嗨", "hello", "hi"],
+                IntentCategory.BILLING: ["退款", "扣款", "发票", "refund"],
+                IntentCategory.TECHNICAL: ["崩溃", "报错", "error", "crash"],
+                IntentCategory.ACCOUNT: ["密码", "邮箱", "账户", "password"],
+            }
+
+            best_cat, best_score = self._best_pattern_match(msg, specific_patterns)
+            if best_cat != IntentCategory.OTHER:
+                return {"intent": best_cat, "confidence": best_score}
+
+            best_cat, best_score = self._best_pattern_match(msg, generic_patterns)
+            return {"intent": best_cat, "confidence": best_score}
