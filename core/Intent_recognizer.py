@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -404,3 +405,89 @@ class IntentRecognizer:
                 logger.warning(f"远端 Embedding 失败，使用本地向量兜底: {ex}")
 
         return self._local_embedding(text)
+
+    @staticmethod
+    def _local_embedding(text: str, dims: int = 256) -> List[float]:
+        """稳定的字符 n-gram 哈希向量，用于无远端 Embedding 时的语义近似匹配。"""
+        normalized = text.lower().strip()
+        vec = [0.0] * dims
+        tokens = set()
+        for n in (1, 2, 3):
+            if len(normalized) >= n:
+                tokens.update(normalized[i:i + n] for i in range(len(normalized) - n + 1))
+        if not tokens:
+            tokens.add(normalized)
+
+        for token in tokens:
+            digest = hashlib.md5(token.encode("utf-8")).digest()
+            idx = int.from_bytes(digest[:4], "big") % dims
+            sign = 1.0 if digest[4] % 2 == 0 else -1.0
+            vec[idx] += sign
+        return vec
+
+    def _urgency(self, message: str, intent: IntentCategory) -> UrgencyLevel:
+        msg = message.lower()
+        for level, kws in _URGENCY_KEYWORDS.items():
+            if any(kw in msg for kw in kws):
+                return level
+        if intent in (IntentCategory.ESCALATION, IntentCategory.HUMAN_HANDOFF):
+            return UrgencyLevel.HIGH
+        if intent == IntentCategory.COMPLAINT:
+            return UrgencyLevel.MEDIUM
+        return UrgencyLevel.LOW
+
+    def _cache_key(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+        payload = {"message": self._clean_text(message)[:200]}
+        if history:
+            payload["history"] = [
+                {
+                    "role": self._clean_text(item.get("role", ""))[:20],
+                    "content": self._clean_text(item.get("content", ""))[:160],
+                }
+                for item in history[-3:]
+            ]
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _unique(values: List[str]) -> List[str]:
+        return list(dict.fromkeys(value.strip() for value in values if value and value.strip()))
+
+    @staticmethod
+    def _best_pattern_match(
+            message: str,
+            patterns: Dict[IntentCategory, List[str]],
+    ) -> tuple[IntentCategory, float]:
+        best_cat, best_score = IntentCategory.OTHER, 0.0
+        for cat, kws in patterns.items():
+            hits = sum(1 for kw in kws if kw in message)
+            if not hits:
+                continue
+            # 单个明确业务关键词就给可用置信度；多个关键词命中时提高置信度。
+            score = min(1.0, 0.5 + 0.25 * (hits - 1))
+            if score > best_score:
+                best_score, best_cat = score, cat
+        return best_cat, best_score
+
+    @staticmethod
+    def _intent_group(intent: IntentCategory) -> str:
+        return _INTENT_GROUPS.get(intent, intent).value
+
+    @staticmethod
+    def _clean_text(value: Any) -> str:
+        """移除 Unicode 代理字符，避免 HTTP 客户端编码 prompt 时崩溃。"""
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            value = str(value)
+        return value.encode("utf-8", errors="ignore").decode("utf-8")
+
+    @property
+    def cache_stats(self) -> Dict[str, Any]:
+        total = self.cache_hits + self.cache_misses
+        return {
+            "size": len(self._cache),
+            "hits": self.cache_hits,
+            "misses": self.cache_misses,
+            "hit_rate": self.cache_hits / total if total else 0.0,
+        }
