@@ -213,3 +213,88 @@ class MemoryManager:
             logger.info(f"用户画像已更新: {user_id}")
         except Exception as ex:
             logger.warning(f"更新用户画像失败: {ex}")
+
+
+# ── 读取 ──────────────────────────────────────────────────────────────────
+
+    async def get_context(self, user_id: str, conv_id: str, query: str = "") -> MemoryContext:
+        """
+        构建完整的记忆上下文。
+
+        query 用于从情景记忆中检索语义相关的历史片段。
+        """
+        # 1. 工作记忆（当前会话最近消息）
+        user_id = self._safe_text(user_id)
+        conv_id = self._safe_text(conv_id)
+        query = self._safe_text(query)
+
+        recent = await self._get_working_memory(user_id, conv_id)
+
+        # 2. 情景记忆（跨会话语义检索）
+        history = await self._search_episodic(
+            user_id,
+            conv_id,
+            query or (recent[-1].content if recent else ""),
+        )
+
+        # 3. 用户画像
+        profile = await self._get_profile(user_id)
+
+        # 4. 会话摘要（如果已压缩过）
+        summary = await self._redis.get(self._summary_key(user_id, conv_id)) or ""
+
+        return MemoryContext(
+            recent_messages=recent,
+            relevant_history=history,
+            user_profile=profile,
+            summary=summary,
+        )
+
+# ── 压缩（防止 context 爆炸）─────────────────────────────────────────────
+
+    async def _compress(self, user_id: str, conv_id: str) -> None:
+        """
+        工作记忆压缩：
+          1. 用 LLM 对旧消息生成摘要
+          2. 摘要存 Redis（覆盖旧摘要）
+          3. 旧消息存入情景记忆（ChromaDB）供跨会话检索
+          4. 工作记忆只保留最近 5 条
+        """
+        messages = await self._get_working_memory(user_id, conv_id)
+        if len(messages) < self.COMPRESS_AT:
+            return
+
+        to_compress = messages[:-5]   # 保留最近 5 条
+        keep        = messages[-5:]
+
+        # LLM 摘要
+        text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in to_compress))
+        prompt = self._safe_text(f"用 2-3 句话总结以下对话的关键信息：\n{text}")
+        try:
+            resp = await self._client.messages.create(
+                model=self._model, max_tokens=256, temperature=0.0,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            summary = self._safe_text(extract_text_content(resp.content)).strip()
+        except Exception:
+            summary = f"对话包含 {len(to_compress)} 条消息（摘要生成失败）"
+
+        # 存摘要到 Redis
+        skey = self._summary_key(user_id, conv_id)
+        old_summary = await self._redis.get(skey) or ""
+        new_summary = await self._merge_summary(old_summary, summary)
+        await self._redis.setex(skey, 86400, new_summary)
+
+        # 旧消息存入情景记忆
+        await self._store_episodic(user_id, conv_id, text, summary)
+
+        # 重置工作记忆为最近 5 条
+        key = self._wm_key(user_id, conv_id)
+        await self._redis.delete(key)
+        for m in reversed(keep):
+            await self._redis.lpush(key, json.dumps({
+                "role": m.role.value, "content": m.content,
+                "ts": m.timestamp.isoformat(), "metadata": m.metadata,
+            }))
+        await self._redis.expire(key, 86400)
+        logger.info(f"工作记忆压缩完成: {user_id}/{conv_id}，摘要 {len(summary)} 字")
