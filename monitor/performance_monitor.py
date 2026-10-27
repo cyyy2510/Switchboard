@@ -7,10 +7,11 @@ import datetime
 import logging
 import statistics
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Dict, Deque, Optional, Any, List, Counter
 
+import httpx
 from prometheus_client import Gauge, Histogram, start_http_server
 
 logger = logging.getLogger(__name__)
@@ -259,3 +260,49 @@ class PerformanceMonitor:
             # 异步发送 Webhook（不阻塞采集循环）
             if self._webhook:
                 asyncio.create_task(self._send_webhook(alert))
+
+    def _generate_routing_suggestions(self, agent_stats: Dict[str, Any]) -> None:
+        """
+        基于 Agent 在线表现生成路由优化建议。
+        这是 Monitor → Orchestrator 反馈闭环的体现。
+        """
+        for agent_key, s in agent_stats.items():
+            if s["success_rate"] < 0.85 and s["total"] > 10:
+                self._add_suggestion(Suggestion(
+                    title=f"Agent {agent_key} 成功率偏低",
+                    detail=f"成功率 {s['success_rate']:.1%}，路由评分 {s['routing_score']:.3f}",
+                    action=(
+                        "Orchestrator 的 _best_agent() 已自动降低该 Agent 的路由权重。\n"
+                        "建议：1. 检查 system_prompt 是否需要优化\n"
+                        "      2. 检查该类型问题的复杂度是否超出 Agent 能力\n"
+                        "      3. 考虑增加同类型 Agent 实例"
+                    ),
+                    priority=8,
+                ))
+
+    def _add_suggestion(self, s: Suggestion) -> None:
+        # 去重：相同 title 不重复添加
+        if not any(x.title == s.title for x in self._suggestions):
+            self._suggestions.append(s)
+            logger.info(f"优化建议 [P{s.priority}]: {s.title}")
+
+    async def _send_webhook(self, alert: Alert) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as c:
+                await c.post(self._webhook, json=asdict(alert))  # type: ignore
+        except Exception as ex:
+            logger.error(f"Webhook 发送失败: {ex}")
+
+    # ── 查询接口 ──────────────────────────────────────────────────────────────
+
+    def summary(self) -> Dict[str, Any]:
+        """返回当前监控摘要，供 API 层暴露。"""
+        return {
+            "agent_stats":   self._orchestrator.get_stats(),
+            "tool_stats":    self._tool_manager.get_stats(),
+            "active_alerts": [asdict(a) for a in self._alerts if not a.resolved][-10:],
+            "suggestions":   [
+                {"title": s.title, "action": s.action, "priority": s.priority}
+                for s in sorted(self._suggestions, key=lambda x: -x.priority)[:5]
+            ],
+        }
