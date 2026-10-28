@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import inspect
 import json
@@ -721,3 +722,117 @@ class AgentOrchestrator:
             return []
         limit = max(1, min(int(limit or 20), len(self._recent_tool_traces)))
         return list(reversed(list(self._recent_tool_traces)[-limit:]))
+
+    # ── 主入口 ────────────────────────────────────────────────────────────────
+
+    async def run(self, req: Request) -> OrchestratorResult:
+        """
+        处理一次请求的完整流程：
+          意图识别 → 路由选 Agent → 执行 → 检查升级 → 返回结果
+        """
+        t0 = time.monotonic()
+
+        # 1. 意图识别（如果调用方已识别则跳过）
+        if req.intent is None:
+            intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
+            req.intent  = intent_result.intent
+            req.intent_group = intent_result.intent_group
+            req.urgency = intent_result.urgency
+            req.intent_confidence = intent_result.confidence
+
+        if self._needs_clarification(req):
+            result = OrchestratorResult(
+                request_id=req.request_id,
+                response="我还不能确定您要处理的是哪类问题。请补充一下是订单物流、退款账单、账户资料，还是技术故障？",
+                agent_type=AgentType.GENERAL,
+                intent=req.intent,
+                escalated=False,
+                latency_ms=(time.monotonic() - t0) * 1000,
+                agent_types=[AgentType.GENERAL],
+                primary_agent=AgentType.GENERAL,
+                routing_reason="低置信度 OTHER 意图，先澄清用户需求",
+                routing_confidence=req.intent_confidence,
+            )
+            self._record_tool_trace(result)
+            return result
+
+        # 复杂问题自动并行协作，例如同一句同时涉及登录故障和扣款/退款。
+        decision = self._route_decision(req)
+        if decision.multi_agent:
+            return await self.run_parallel(req, decision)
+
+        # 2. 执行主 Agent（含降级）
+        response = await self._execute(req, decision.primary_agent)
+
+        # 4. 升级检查
+        escalated = False
+        if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent in (
+            IntentCategory.ESCALATION,
+            IntentCategory.HUMAN_HANDOFF,
+        ):
+            escalated = True
+            logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
+            # 生产环境：此处创建工单、通知人工客服
+
+        result = OrchestratorResult(
+            request_id=req.request_id,
+            response=response.content,
+            agent_type=response.agent_type,
+            intent=req.intent,
+            escalated=escalated,
+            latency_ms=(time.monotonic() - t0) * 1000,
+            agent_types=[response.agent_type],
+            primary_agent=decision.primary_agent,
+            supporting_agents=[],
+            tools_used=list(response.tools_used),
+            tool_traces=list(response.tool_traces),
+            routing_reason=decision.reason,
+            routing_confidence=decision.confidence,
+        )
+        self._record_tool_trace(result)
+        return result
+
+    async def run_parallel(self, req: Request, decision: RoutingDecision) -> OrchestratorResult:
+        """
+        并行派发给多个 Agent，合并结果。
+        适用于复杂问题（如同时涉及技术和账单）。
+        """
+        t0 = time.monotonic()
+        agent_types = decision.agent_types
+        tasks = [self._execute(req, at) for at in agent_types]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+        valid_responses = [r for r in responses if isinstance(r, AgentResponse)]
+        combined = await self._composer.compose(req, valid_responses)
+        escalated = any(isinstance(r, AgentResponse) and r.escalate for r in responses)
+        tools_used = list(dict.fromkeys(
+            tool_name
+            for response in valid_responses
+            for tool_name in response.tools_used
+        ))
+        tool_traces = [
+            trace
+            for response in valid_responses
+            for trace in response.tool_traces
+        ]
+        result = OrchestratorResult(
+            request_id=req.request_id,
+            response=combined,
+            agent_type=decision.primary_agent,
+            intent=req.intent,
+            escalated=escalated,
+            latency_ms=(time.monotonic() - t0) * 1000,
+            agent_types=[
+                r.agent_type for r in responses
+                if isinstance(r, AgentResponse) and r.success
+            ] or agent_types,
+            primary_agent=decision.primary_agent,
+            supporting_agents=decision.supporting_agents,
+            tools_used=tools_used,
+            tool_traces=tool_traces,
+            routing_reason=decision.reason,
+            routing_confidence=decision.confidence,
+        )
+        self._record_tool_trace(result)
+        return result
+
