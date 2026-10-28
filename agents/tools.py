@@ -161,6 +161,51 @@ def create_handoff_summary(req: Request, args: Dict[str, Any]) -> Dict[str, Any]
         "sensitive_data_required": False,
     }
 
+def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
+    """构建所有 Agent 可共享的 RAG 工具。"""
+
+    async def search_knowledge_base(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+        query = str(args.get("query") or req.message or "").strip()
+        top_k = int(args.get("top_k", 5) or 5)
+        if not query:
+            return {"success": False, "error": "query 不能为空", "results": []}
+        if tool_manager is None:
+            return {"success": False, "error": "RAG 工具未初始化", "results": []}
+
+        result = await tool_manager.search_with_rewrite(
+            "knowledge_search",
+            query,
+            top_k=top_k,
+        )
+        if not getattr(result, "success", False):
+            return {
+                "success": False,
+                "query": query,
+                "error": getattr(result, "error", "知识库检索失败"),
+                "results": [],
+                "reranked": False,
+            }
+
+        return {
+            "success": True,
+            "query": query,
+            "top_k": top_k,
+            "results": result.data,
+            "reranked": bool(getattr(result, "reranked", False)),
+        }
+
+    return {
+        "search_knowledge_base": make_tool(
+            "search_knowledge_base",
+            "检索知识库并返回最相关的文档片段；可用于通用、技术、账单和升级场景。",
+            {
+                "query": {"type": "string", "description": "用户问题或检索关键词"},
+                "top_k": {"type": "integer", "description": "返回结果条数"},
+            },
+            search_knowledge_base,
+            required=["query"],
+        )
+    }
 
 def general_tools() -> Dict[str, AgentToolSpec]:
     return {

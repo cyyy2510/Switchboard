@@ -1,3 +1,4 @@
+import datetime
 import inspect
 import json
 import logging
@@ -5,12 +6,13 @@ import os
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Tuple, Optional, List, Dict, Any
 from anthropic import AsyncAnthropic
 
-from agents.tools import AgentToolSpec, general_tools, technical_tools, billing_tools, escalation_tools
+from agents.tools import AgentToolSpec, general_tools, technical_tools, billing_tools, escalation_tools, \
+    build_shared_rag_tools
 from core.Intent_recognizer import IntentCategory, UrgencyLevel, IntentRecognizer
 from core.llm_utils import extract_text_content
 
@@ -653,3 +655,69 @@ class AgentOrchestrator:
             AgentType.ESCALATION: [self._make_agent(EscalationAgent, client, model, skill_manager)],
         }
         self.set_shared_tools(build_shared_rag_tools(rag_tool_manager))
+
+    @staticmethod
+    def _make_agent(
+        agent_cls: type[BaseAgent],
+        client: AsyncAnthropic,
+        default_model: str,
+        skill_manager: Optional[Any],
+    ) -> BaseAgent:
+        """按角色创建 Agent，并允许用环境变量覆盖该角色的模型。
+
+        可使用更强模型，通用接待可使用更快模型，升级节点本身不需要调用 LLM。
+        """
+        profile = agent_cls.profile
+        env_name = f"ECHOMIND_{agent_cls.agent_type.value.upper()}_MODEL"
+        model = os.getenv(env_name, "").strip() or profile.model
+        configured_profile = replace(profile, model=model) if model else profile
+        return agent_cls(client, default_model, skill_manager, profile=configured_profile)
+
+    def set_skill_manager(self, skill_manager: Optional[Any]) -> None:
+        """更新 SkillManager 引用，供运行时重载或测试替换使用。"""
+        self._skill_manager = skill_manager
+        self._composer._skill_manager = skill_manager
+        for agents in self._pool.values():
+            for agent in agents:
+                agent._skill_manager = skill_manager
+
+    def set_shared_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
+        """更新所有 Agent 共享的工具白名单。"""
+        self._shared_tools = dict(tools or {})
+        for agents in self._pool.values():
+            for agent in agents:
+                agent.set_shared_tools(self._shared_tools)
+
+    async def recognize_intent(
+        self,
+        message: str,
+        history: Optional[List[Dict[str, str]]] = None,
+    ):
+        """对外暴露意图识别，供 API 层先判断是否需要 RAG 等前置能力。"""
+        return await self._intent_recognizer.recognize(message, history=history)
+
+    def _record_tool_trace(self, result: OrchestratorResult) -> None:
+        trace = {
+            "request_id": result.request_id,
+            "timestamp": datetime.now().isoformat(),
+            "intent": result.intent.value if result.intent else None,
+            "primary_agent": result.primary_agent.value if result.primary_agent else None,
+            "supporting_agents": [agent.value for agent in result.supporting_agents],
+            "tools_used": list(result.tools_used),
+            "tool_calls": list(result.tool_traces),
+            "escalated": result.escalated,
+            "latency_ms": round(result.latency_ms, 1),
+        }
+        self._recent_tool_traces.append(trace)
+
+    def get_tool_trace(self, request_id: str) -> Optional[Dict[str, Any]]:
+        for trace in reversed(self._recent_tool_traces):
+            if trace.get("request_id") == request_id:
+                return trace
+        return None
+
+    def get_recent_tool_traces(self, limit: int = 20) -> List[Dict[str, Any]]:
+        if not self._recent_tool_traces:
+            return []
+        limit = max(1, min(int(limit or 20), len(self._recent_tool_traces)))
+        return list(reversed(list(self._recent_tool_traces)[-limit:]))
