@@ -836,3 +836,298 @@ class AgentOrchestrator:
         self._record_tool_trace(result)
         return result
 
+
+    # ── 路由逻辑 ──────────────────────────────────────────────────────────────
+
+    def _route(self, intent: Optional[IntentCategory], urgency: Optional[UrgencyLevel]) -> AgentType:
+        """
+        三层路由决策：
+          1. 意图映射
+          2. 紧急度覆盖（CRITICAL 直接升级）
+          3. 默认 GENERAL
+        """
+        if urgency == UrgencyLevel.CRITICAL:
+            return AgentType.ESCALATION
+
+        if intent and intent in self._INTENT_ROUTING:
+            target = self._INTENT_ROUTING[intent]
+            # 如果目标类型有可用实例则使用，否则降级
+            if target in self._pool and self._pool[target]:
+                return target
+
+        return AgentType.GENERAL
+
+    def _route_decision(self, req: Request) -> RoutingDecision:
+        """
+        结构化路由决策。
+
+        先处理紧急/转人工，再用领域分数决定主 Agent 和辅助 Agent。
+        这样可以表达“主处理 + 辅助诊断”，避免关键词命中后无主次地拼接。
+        """
+        if req.urgency == UrgencyLevel.CRITICAL:
+            return RoutingDecision(
+                primary_agent=AgentType.ESCALATION,
+                reason="紧急度为 CRITICAL，触发升级路由",
+                confidence=1.0,
+            )
+
+        if req.intent in (IntentCategory.ESCALATION, IntentCategory.HUMAN_HANDOFF):
+            return RoutingDecision(
+                primary_agent=AgentType.ESCALATION,
+                reason=f"意图为 {req.intent.value if req.intent else 'unknown'}，触发升级路由",
+                confidence=max(req.intent_confidence, 0.8),
+            )
+
+        scores = self._domain_scores(req)
+        degraded_agents = {
+            agent_type
+            for agent_type in (AgentType.TECHNICAL, AgentType.BILLING)
+            if scores.get(agent_type, 0.0) > 0 and self._monitor_degraded(agent_type)
+        }
+        available_scores = {
+            agent_type: score
+            for agent_type, score in scores.items()
+            if agent_type == AgentType.GENERAL
+            or (self._pool.get(agent_type) and agent_type not in degraded_agents)
+        }
+        if not available_scores:
+            return RoutingDecision(
+                primary_agent=AgentType.GENERAL,
+                reason="无可用专属 Agent，降级到 GeneralAgent",
+                confidence=0.1,
+            )
+
+        ordered = sorted(available_scores.items(), key=lambda item: item[1], reverse=True)
+        primary_agent, primary_score = ordered[0]
+
+        collaboration_targets = self._collaboration_targets(req)
+        supporting_agents = [
+            agent_type
+            for agent_type in collaboration_targets
+            if agent_type != primary_agent and agent_type in available_scores
+        ]
+
+        if not supporting_agents:
+            supporting_agents = [
+                agent_type
+                for agent_type, score in ordered[1:]
+                if agent_type != AgentType.GENERAL
+                and score >= 0.45
+                and score >= primary_score * 0.55
+            ]
+
+        reason = self._routing_reason(req, available_scores, primary_agent, supporting_agents)
+        if degraded_agents:
+            degraded_text = ", ".join(sorted(agent.value for agent in degraded_agents))
+            reason += f", monitor_fallback=[{degraded_text}]"
+        return RoutingDecision(
+            primary_agent=primary_agent,
+            supporting_agents=supporting_agents,
+            reason=reason,
+            confidence=round(min(primary_score, 1.0), 3),
+        )
+
+    def _domain_scores(self, req: Request) -> Dict[AgentType, float]:
+        """按意图、关键词和实体为各领域 Agent 打分。"""
+        msg = req.message.lower()
+        scores = {
+            AgentType.GENERAL: 0.1,
+            AgentType.TECHNICAL: 0.0,
+            AgentType.BILLING: 0.0,
+        }
+
+        if req.intent in (
+            IntentCategory.QUERY,
+            IntentCategory.ORDER_STATUS,
+            IntentCategory.LOGISTICS,
+            IntentCategory.REQUEST,
+            IntentCategory.COMPLAINT,
+            IntentCategory.GREETING,
+            IntentCategory.FEEDBACK,
+            IntentCategory.OTHER,
+        ):
+            scores[AgentType.GENERAL] += 0.55
+
+        if req.intent in (
+            IntentCategory.TECHNICAL,
+            IntentCategory.TECHNICAL_LOGIN,
+            IntentCategory.TECHNICAL_CRASH,
+        ):
+            scores[AgentType.TECHNICAL] += 0.75
+
+        if req.intent in (
+            IntentCategory.BILLING,
+            IntentCategory.ACCOUNT,
+            IntentCategory.ACCOUNT_SECURITY,
+            IntentCategory.REFUND,
+            IntentCategory.INVOICE,
+            IntentCategory.PAYMENT_ISSUE,
+        ):
+            scores[AgentType.BILLING] += 0.75
+
+        technical_kws = ["崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500", "401", "验证码"]
+        billing_kws = ["退款", "退货", "扣款", "发票", "账单", "支付", "订阅", "refund", "invoice", "多扣"]
+        general_kws = ["订单", "物流", "快递", "配送", "会员", "积分", "咨询", "帮助"]
+
+        technical_hits = sum(1 for kw in technical_kws if kw in msg)
+        billing_hits = sum(1 for kw in billing_kws if kw in msg)
+        general_hits = sum(1 for kw in general_kws if kw in msg)
+
+        scores[AgentType.TECHNICAL] += min(0.45, technical_hits * 0.18)
+        scores[AgentType.BILLING] += min(0.45, billing_hits * 0.18)
+        scores[AgentType.GENERAL] += min(0.35, general_hits * 0.12)
+
+        entities = req.entities or {}
+        if entities.get("error_code"):
+            scores[AgentType.TECHNICAL] += 0.2
+        if entities.get("amount"):
+            scores[AgentType.BILLING] += 0.15
+        if entities.get("order_id"):
+            scores[AgentType.GENERAL] += 0.1
+
+        return {agent_type: round(score, 3) for agent_type, score in scores.items()}
+
+    @staticmethod
+    def _routing_reason(
+        req: Request,
+        scores: Dict[AgentType, float],
+        primary_agent: AgentType,
+        supporting_agents: List[AgentType],
+    ) -> str:
+        score_text = ", ".join(
+            f"{agent_type.value}={score:.2f}"
+            for agent_type, score in sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        )
+        support_text = ", ".join(agent.value for agent in supporting_agents) or "none"
+        intent = req.intent.value if req.intent else "unknown"
+        return (
+            f"intent={intent}, group={req.intent_group or 'unknown'}, "
+            f"primary={primary_agent.value}, supporting={support_text}, scores=[{score_text}]"
+        )
+
+    def _collaboration_targets(self, req: Request) -> List[AgentType]:
+        """
+        判断是否需要多个 Agent 并行协作。
+
+        意图识别通常只返回一个主意图；这里用领域关键词补充检测复合问题，
+        例如"登录报错且被重复扣款"需要技术和账单 Agent 同时处理。
+        """
+        msg = req.message.lower()
+        targets: List[AgentType] = []
+
+        technical_kws = ["崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500", "401"]
+        billing_kws = ["退款", "扣款", "发票", "账单", "支付", "订阅", "refund", "invoice"]
+
+        if req.intent in (
+            IntentCategory.TECHNICAL,
+            IntentCategory.TECHNICAL_LOGIN,
+            IntentCategory.TECHNICAL_CRASH,
+        ) or any(kw in msg for kw in technical_kws):
+            targets.append(AgentType.TECHNICAL)
+        if req.intent in (
+            IntentCategory.BILLING,
+            IntentCategory.ACCOUNT,
+            IntentCategory.ACCOUNT_SECURITY,
+            IntentCategory.REFUND,
+            IntentCategory.INVOICE,
+            IntentCategory.PAYMENT_ISSUE,
+        ) or any(kw in msg for kw in billing_kws):
+            targets.append(AgentType.BILLING)
+
+        # 保持顺序去重，并只返回当前有实例的 Agent 类型。
+        deduped = list(dict.fromkeys(targets))
+        return [agent_type for agent_type in deduped if self._pool.get(agent_type)]
+
+    @staticmethod
+    def _needs_clarification(req: Request) -> bool:
+        """低置信度且无明确意图时，先追问，避免误路由。"""
+        if req.intent != IntentCategory.OTHER:
+            return False
+        text = (req.message or "").strip()
+        if len(text) <= 2:
+            return False
+        return req.intent_confidence < 0.5
+
+    def _best_agent(self, agent_type: AgentType) -> Optional[BaseAgent]:
+        """
+        性能路由：从同类 Agent 中选 routing_score() 最高的。
+        这是"基于在线表现动态调整路由"的核心。
+        """
+        agents = self._pool.get(agent_type, [])
+        if not agents:
+            return None
+        return max(agents, key=lambda a: a.stats.routing_score())
+
+    def _monitor_degraded(self, agent_type: AgentType) -> bool:
+        """专业 Agent 降权过高时由路由层回退，确保单实例部署也能生效。"""
+        if agent_type in (AgentType.GENERAL, AgentType.ESCALATION):
+            return False
+        agents = self._pool.get(agent_type, [])
+        if not agents:
+            return False
+        threshold = _env_float(
+            "ECHOMIND_MONITOR_FALLBACK_PENALTY",
+            self.MONITOR_FALLBACK_PENALTY,
+        )
+        penalties = [
+            float(getattr(getattr(agent, "stats", None), "monitor_penalty", 0.0) or 0.0)
+            for agent in agents
+        ]
+        # 只要还有一个健康实例就继续使用该专业类型；全部高降权时才回退。
+        return min(penalties) >= min(max(threshold, 0.0), 0.9)
+
+    async def _execute(self, req: Request, agent_type: AgentType) -> AgentResponse:
+        """执行 Agent，失败时降级到 GeneralAgent。"""
+        agent = self._best_agent(agent_type)
+        if agent is None:
+            agent = self._best_agent(AgentType.GENERAL)
+        if agent is None:
+            return AgentResponse(
+                agent_type=AgentType.GENERAL,
+                content="服务暂时不可用，请稍后重试。",
+                success=False,
+            )
+
+        response = await agent.handle(req)
+
+        # 专属 Agent 失败时降级到 GeneralAgent
+        if not response.success and agent_type not in (AgentType.GENERAL, AgentType.ESCALATION):
+            logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
+            fallback = self._best_agent(AgentType.GENERAL)
+            if fallback:
+                response = await fallback.handle(req)
+
+        return response
+
+    # ── 统计（供 Monitor 读取）────────────────────────────────────────────────
+
+    def get_stats(self) -> Dict[str, Any]:
+        result = {}
+        for agent_type, agents in self._pool.items():
+            for i, agent in enumerate(agents):
+                key = f"{agent_type.value}_{i}"
+                result[key] = {
+                    "total":        agent.stats.total,
+                    "success_rate": round(agent.stats.success_rate, 3),
+                    "avg_ms":       round(agent.stats.avg_ms, 1),
+                    "monitor_penalty": round(agent.stats.monitor_penalty, 3),
+                    "routing_score": round(agent.stats.routing_score(), 3),
+                    "role": agent.profile.role,
+                    "workflow": list(agent.profile.workflow),
+                    "tool_scope": list(agent.profile.tool_scope),
+                    "available_tools": list(agent.get_tools()),
+                    "model": agent._model,
+                }
+        return result
+
+    def update_routing_penalties(self, penalties: Dict[str, float]) -> None:
+        """
+        接收 Monitor 的在线表现反馈，动态调整路由惩罚项。
+
+        penalties 的 key 使用 get_stats() 中的 agent key，例如 technical_0。
+        """
+        for agent_type, agents in self._pool.items():
+            for i, agent in enumerate(agents):
+                key = f"{agent_type.value}_{i}"
+                penalty = penalties.get(key, 0.0)
+                agent.stats.monitor_penalty = min(max(penalty, 0.0), 0.9)
